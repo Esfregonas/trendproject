@@ -1,0 +1,26 @@
+ib:
+  host: "127.0.0.1"
+  port: 7497
+  clientId: 7
+
+data:
+  contract:
+    type: "Stock"
+    symbol: "AAPL"
+    exchange: "SMART"
+    currency: "USD"
+
+  history:
+    durationStr: "10 D"
+    barSizeSetting: "1 min"
+    whatToShow: "TRADES"
+    useRTH: true
+
+bars:
+  kind: "volume"
+  threshold: 300_000
+
+output:
+  dir: "data"
+  save_csv: true
+  save_parquet: true
