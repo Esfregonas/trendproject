@@ -1,0 +1,10 @@
+{
+  "best_params": {
+    "n_estimators": 500,
+    "max_depth": 3,
+    "min_samples_leaf": 1,
+    "max_features": "sqrt",
+    "class_weight": "balanced_subsample"
+  },
+  "best_score_auc_cv": 0.6106174089068825
+}

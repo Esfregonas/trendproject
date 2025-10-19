@@ -1,67 +1,65 @@
 # main.py
 """
-Pipeline com logger + barras de progresso
------------------------------------------
-1) Lê config (config.yaml) e liga ao TWS/Gateway da IB.
-2) Busca OHLCV (time bars) e converte para volume bars.
-3) Extrai features (rápidas + opcionais pesadas, com barra de progresso nas rolling).
-4) Cria labels (Triple-Barrier) + meta-labels.
-5) Constrói X/y, grava em data/ e corre baseline (RF + Purged K-Fold).
+Pipeline principal (didático):
+1) Lê config.yaml e liga ao TWS/Gateway (IB).
+2) Busca OHLCV históricos conforme a config.
+3) Constrói volume-bars com threshold dinâmico (ou absoluto se vier na config).
+4) Extrai features (volatilidade, ATR, entropia, LZ, CUSUM, VPIN).
+5) Calcula labels (triple-barrier) e meta-labels.
+6) Monta matriz X e vetor y, grava em data/.
+7) Lê data/rf_best.json (se existir) e corre baseline com esses parâmetros
+   (agora com calibração isotónica e métricas adicionais: PR-AUC e F1@thr*).
 
-Usamos:
-- log(...) para mostrar cada passo com hora (flush=True).
-- tqdm.pandas() para percentagem nas rolling (entropia/LZ) com .progress_apply().
+Nota: manter TWS aberto e API ativa (porta 7497).
 """
 
 from __future__ import annotations
 
-import pandas as pd
+import json
 from pathlib import Path
-from time import perf_counter as now
+from time import perf_counter
 from datetime import datetime
 
-# -------------------- logger simples com hora --------------------
-def log(msg: str) -> None:
-    """Imprime mensagem com timestamp (sem buffer)."""
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+import pandas as pd
 
-# -------------------- tqdm para progresso nas rolling ------------
-try:
-    from tqdm import tqdm
-    tqdm.pandas()  # habilita Series/DataFrame.progress_apply()
-except Exception:
-    # se tqdm não existir, .progress_apply() vira .apply() silenciosamente
-    class _DummyTQDM:
-        @staticmethod
-        def pandas(): ...
-    tqdm = _DummyTQDM()  # type: ignore
-
-# -------------------- parâmetros (ajusta aqui) -------------------
-DEBUG_FAST = False           # True => só features rápidas (vol10, atr14, CUSUM)
-TB_PT = 0.005                # take-profit  (ex.: 0.5%)
-TB_SL = 0.005                # stop-loss    (ex.: 0.5%)
-TB_MAX_BARS = 10             # janela máxima (vertical barrier)
-VOLUME_THRESHOLD_MULT = 1.0  # 1.0× média de volume (ajusta se necessário)
-
-# Quando DEBUG_FAST=False podes ligar/desligar features pesadas:
-FEATURE_ENTROPY = True       # rolling Shannon entropy (com barra %)
-FEATURE_LZ       = True      # rolling Lempel-Ziv complexity (com barra %)
-FEATURE_VPIN     = True      # VPIN clássico
-
-# -------------------- módulos do projeto -------------------------
-from data_fetcher import load_cfg, connect_ib, make_contract, fetch_data
-from bars        import volume_bars
-from features    import (
-    rolling_volatility, atr, shannon_entropy, lz_complexity, cusum_efp, vpin
+# --- helpers do teu módulo data_fetcher (com explicações in-line) ---
+from data_fetcher import (
+    load_cfg,      # lê o config.yaml
+    connect_ib,    # abre ligação ao TWS/Gateway
+    make_contract, # fabrica Stock/FX/Future a partir do dict de config
+    fetch_data,    # pede OHLCV e devolve DataFrame
 )
-from labeler     import apply_triple_barrier, meta_labeling
-from model       import run_baseline
+
+# --- módulos do projeto ---
+from bars import volume_bars
+from features import (
+    rolling_volatility,
+    atr,
+    shannon_entropy,
+    lz_complexity,
+    cusum_efp,
+    vpin,
+)
+from labeler import apply_triple_barrier, meta_labeling
+from model import run_baseline  # -> agora devolve também métricas por fold/médias
+
+
+# ===================== opções rápidas (podes ajustar) ===================== #
+# multiplicador da média de volume para definir o threshold das volume-bars
+VOLUME_THRESHOLD_MULT = 1.0  # 1.0 = 100% da média; põe 0.5/2.0 se precisares
+# ========================================================================= #
+
+
+def log(msg: str) -> None:
+    """Print com timestamp (simples para acompanhar o progresso)."""
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 
 def main():
+    t0 = perf_counter()
     log(">> main() começou")
 
-    # 0) Config + ligação IB
+    # 0) Ler configuração e abrir ligação à IB
     cfg = load_cfg("config.yaml")
     ib = connect_ib(
         host=cfg["ib"]["host"],
@@ -70,108 +68,140 @@ def main():
     )
 
     try:
-        # 1) Contrato e OHLCV (time bars)
+        # 1) Contrato e dados brutos (evita hardcode: lê tudo da config)
         contract = make_contract(cfg["data"]["contract"])
-        h = cfg["data"]["history"]
+        h        = cfg["data"]["history"]
 
-        log("A pedir dados históricos à IB...")
+        log("A pedir dados históricos à IB…")
         df = fetch_data(
             ib=ib,
             contract=contract,
-            duration=h["durationStr"],        # ex.: "10 D"
-            bar_size=h["barSizeSetting"],     # ex.: "1 min"
-            what_to_show=h.get("whatToShow"), # None => TRADES (stocks) / MIDPOINT (FX)
+            duration=h["durationStr"],            # ex.: "5 D"
+            bar_size=h["barSizeSetting"],         # ex.: "5 mins"
+            what_to_show=h.get("whatToShow"),     # None => TRADES/MIDPOINT por defeito
             use_rth=h.get("useRTH", True),
         )
-        log(f"Dados brutos (OHLCV) recebidos: {df.shape}")
+        print(f"\nDados brutos (OHLCV) recebidos: {df.shape}")
+        print(df.head(), "\n")
         if df.empty:
-            log("Sem dados — ajusta 'durationStr'/'barSizeSetting' no config.yaml.")
+            log("Sem dados — verifica duration/barSize na config.yaml.")
             return
-        print(df.head(), "\n")  # amostra (ok manter como print normal)
 
-        # 2) Volume bars
-        avg_vol   = df["volume"].mean()
-        threshold = VOLUME_THRESHOLD_MULT * avg_vol
-        log(f"Média de volume: {avg_vol:.0f} | threshold usado: {threshold:.0f}")
+        # 2) Threshold das volume-bars
+        #    Se houver 'bars.threshold' na config usamos esse absoluto;
+        #    caso contrário, usamos média*VOLUME_THRESHOLD_MULT (dinâmico).
+        cfg_threshold = (cfg.get("bars", {}) or {}).get("threshold", None)
+        if cfg_threshold:
+            threshold = float(cfg_threshold)
+            thr_src = "config"
+        else:
+            avg_vol = float(df["volume"].mean())
+            threshold = max(1.0, VOLUME_THRESHOLD_MULT * avg_vol)
+            thr_src = f"{VOLUME_THRESHOLD_MULT:.1f}×média"
+        log(f"Média de volume: {df['volume'].mean():.0f} | "
+            f"threshold usado: {threshold:.0f} ({thr_src})")
 
-        log("A construir volume bars...")
+        # 3) Construir volume-bars
+        log("A construir volume-bars…")
         vb = volume_bars(df, volume_threshold=threshold)
-        log(f"Volume bars construídas: {vb.shape}")
+        print(f"Barras originais: {df.shape} | volume-bars: {vb.shape}\n")
         if vb.empty:
-            log("Volume bars vazias — baixa o threshold ou aumenta a janela no YAML.")
+            log("Volume-bars vazias — baixa o threshold ou aumenta a janela.")
             return
 
-        # 3) Features
-        log("A calcular features...")
-        t0 = now()
-        features_dict: dict[str, pd.Series] = {}
+        # 4) Features (primeiro conjunto)
+        log("A calcular features…")
+        t_feats = perf_counter()
 
-        # 3.1) rápidas
-        features_dict["vol10"]   = rolling_volatility(vb["close"], window=10)
-        features_dict["atr14"]   = atr(vb, window=14)
-        features_dict["sb_flag"] = cusum_efp(vb["close"], threshold=2.5).astype(float)
+        vol10   = rolling_volatility(vb["close"], window=10)          # volatilidade
+        atr14   = atr(vb, window=14)                                  # ATR clássico
+        ent20   = vb["close"].rolling(20).apply(shannon_entropy, False)
+        lz20    = vb["close"].rolling(20).apply(lz_complexity,   False)
+        sb_flag = cusum_efp(vb["close"], threshold=2.5)               # quebras
+        vpin10  = vpin(vb, bucket_size=10)                            # fluxo ordens (proxy)
 
-        # 3.2) pesadas (com barra de progresso nas rolling)
-        if not DEBUG_FAST:
-            if FEATURE_ENTROPY:
-                # tqdm.pandas() permite .progress_apply() -> mostra % no terminal
-                features_dict["ent20"] = (
-                    vb["close"].rolling(20)
-                    .progress_apply(shannon_entropy, raw=False)
-                )
-            if FEATURE_LZ:
-                features_dict["lz20"] = (
-                    vb["close"].rolling(20)
-                    .progress_apply(lz_complexity, raw=False)
-                )
-            if FEATURE_VPIN:
-                # Se a tua função vpin() tiver loops, podes pôr tqdm lá dentro (em features.py)
-                features_dict["vpin10"] = vpin(vb, bucket_size=10)
+        print(f"Features calculadas em {perf_counter()-t_feats:.3f}s\n")
+        print("vol10 head:\n",   vol10.head(),   "\n")
+        print("atr14 head:\n",   atr14.head(),   "\n")
+        print("sb_flag head:\n", sb_flag.head(), "\n")
+        print("ent20 head:\n",   ent20.head(),   "\n")
+        print("lz20  head:\n",   lz20.head(),    "\n")
+        print("vpin10 head:\n",  vpin10.head(),  "\n")
 
-        log(f"Features calculadas em {now()-t0:.3f}s")
-        # heads de inspeção (podem ter NaN no início por causa das janelas)
-        for name, ser in features_dict.items():
-            print(f"{name} head:\n", ser.head(), "\n")
-
-        # 4) Labels + Meta-labels
-        log("A calcular labels (Triple-Barrier)...")
-        labels = apply_triple_barrier(vb, pt=TB_PT, sl=TB_SL, max_bars=TB_MAX_BARS)
-        log("Labels calculadas. A criar meta-labels...")
+        # 5) Labels e meta-labels
+        log("A calcular labels (Triple-Barrier)…")
+        labels = apply_triple_barrier(vb, pt=0.005, sl=0.005, max_bars=10)
+        log("Labels calculadas. A criar meta-labels…")
         meta = meta_labeling(labels)
-        log(f"Labels primários: {labels.value_counts().to_dict()} | Meta: {meta.value_counts().to_dict()}")
+        print("Labels primários (contagem):", labels.value_counts().to_dict())
+        print("Meta-labels (contagem):",      meta.value_counts().to_dict(), "\n")
 
-        # 5) X/y
-        log("A montar X e alinhar com y...")
-        feats = pd.concat(features_dict, axis=1)
+        # 6) Montar matriz de features X
+        feats = pd.concat(
+            {
+                "vol10":   vol10,
+                "atr14":   atr14,
+                "sb_flag": sb_flag.astype(float),  # 0/1 -> float
+                "ent20":   ent20,
+                "lz20":    lz20,
+                "vpin10":  vpin10,
+            },
+            axis=1,
+        )
+
+        # Limpar NaNs e alinhar com y (meta)
         X = feats.dropna()
         y = meta.reindex(X.index).dropna()
+
+        # Interseção defensiva (se por acaso houver desalinhamento residual)
         idx = X.index.intersection(y.index)
         X, y = X.loc[idx], y.loc[idx]
-        log(f"Shape X: {X.shape} | Distribuição y: {y.value_counts().to_dict()}")
-        # verificação explícita das colunas
-        log(f"Colunas em X: {list(X.columns)} | Amostras em X: {len(X)}")
+        print(f"Shape X depois do dropna/alinhamento: {X.shape}")
+        print("Distribuição y (meta):", y.value_counts().to_dict(), "\n")
 
-        # 6) Guardar
-        log("A guardar X/y em disco...")
+        # 7) Guardar artefactos (X, y)
         out = Path("data"); out.mkdir(exist_ok=True)
-        X.to_parquet(out / "X.parquet"); X.to_csv(out / "X.csv")
+        X.to_parquet(out / "X.parquet");        X.to_csv(out / "X.csv")
         y.to_frame("y").to_parquet(out / "y.parquet"); y.to_frame("y").to_csv(out / "y.csv")
-        log(f"Artefactos gravados em: {out.resolve()}")
+        print(f"Artefactos gravados em: {out.resolve()}")
 
-        # 7) Baseline
-        log("=== Baseline: RandomForest + Purged K-Fold ===")
-        _ = run_baseline(
+        # 8) Ler hiperparâmetros do tuning (se existirem) e correr baseline
+        rf_kwargs: dict = {}
+        best_path = out / "rf_best.json"
+        if best_path.exists():
+            with open(best_path) as f:
+                rf_kwargs = json.load(f).get("best_params", {}) or {}
+            print("\n[INFO] A usar hiperparâmetros do tuning:", rf_kwargs)
+
+        log("=== Baseline: RandomForest (calibrated) + Purged K-Fold ===")
+        results = run_baseline(
             X, y,
             n_splits=5,
             purge=5,
             embargo=0.01,
-            n_estimators=300,
-            max_depth=None,
+            **rf_kwargs,   # se vieram do JSON, sobrepõem os defaults
         )
-        log("Baseline concluído.")
+
+        # --- Guardar métricas estruturadas do baseline (NOVIDADE) ---
+        # Ficheiros: cv_metrics_folds.csv (todas as folds) e cv_metrics_mean.json (médias)
+        results_dir = Path("data"); results_dir.mkdir(exist_ok=True)
+        results["cv_metrics_folds"].to_csv(results_dir / "cv_metrics_folds.csv", index=False)
+
+        with open(results_dir / "cv_metrics_mean.json", "w") as f:
+            json.dump(results["cv_metrics_mean"], f, indent=2)
+
+        # Nota: feature_importance.csv já é gravado pelo próprio model.py;
+        # manter esta linha se quiseres sobrepor: results["feature_importance"].to_csv(results_dir / "feature_importance.csv")
+
+        print("\nResumo (CV médias):")
+        print(results["cv_metrics_mean"])
+        print("\nPrimeiras linhas de cv_metrics_folds.csv:")
+        print(results["cv_metrics_folds"].head().to_string(index=False))
+
+        log(f"Baseline concluído. Tempo total: {perf_counter()-t0:.2f}s")
 
     finally:
-        log("A encerrar ligação à IB...")
+        # fecha SEMPRE a ligação, mesmo que haja erro acima
         ib.disconnect()
         log("Ligação IB encerrada. Fim do script.")
 
