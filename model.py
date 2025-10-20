@@ -6,15 +6,19 @@ Modelagem + Validação Temporal + Importances
 - Calibração (isotónica) via CalibratedClassifierCV para probabilidades calibradas.
 - Métricas por fold e médias: acc, f1@0.5, roc-auc, pr-auc, f1@thr* e o próprio thr*.
 - Feature importances (Gini + Permutation) guardadas em data/feature_importance.csv.
+- Devolve também 'oof_prob' (probabilidades out-of-fold) para análise PR/ROC OOS.
 - Aceita hiperparâmetros extra via **rf_kwargs (ex.: vindos de data/rf_best.json).
+- (NOVO) Aceita 'sample_weight' para treinar com pesos (uniqueness/time-decay do AFML).
 
 Uso típico (a partir do main.py):
     from model import run_baseline
-    _ = run_baseline(
+    results = run_baseline(
         X, y,
         n_splits=5, purge=5, embargo=0.01,
         # defaults sobreponíveis por **rf_kwargs:
         n_estimators=300, max_depth=None,
+        # pesos opcionais (Series alinhada a X.index):
+        # sample_weight=w,
         # e.g., **{"n_estimators": 500, "max_depth": 3, "min_samples_leaf": 1}
     )
 """
@@ -76,6 +80,8 @@ def _apply_purge_and_embargo(train_idx: np.ndarray,
     """
     Purge: remove do treino a vizinhança do conjunto de teste (antes e depois).
     Embargo: remove do treino um bloco imediatamente a seguir ao teste.
+
+    Isto evita fuga de informação quando as janelas de treino/teste são próximas.
     """
     # Purge (remove [min- purge, max+ purge] do treino)
     lo = max(int(test_idx.min()) - int(purge), 0)
@@ -138,13 +144,21 @@ def run_baseline(
     n_estimators: int = 300,
     max_depth: Optional[int] = None,
     random_state: int = 42,
+    sample_weight: Optional[pd.Series] = None,  # <- NOVO: pesos opcionais (alinhados a X.index)
     **rf_kwargs,  # hiperparâmetros adicionais (min_samples_leaf, max_features, ...)
 ) -> Dict:
     """
     Treina RandomForest com Purged K-Fold + Calibração (isotónica), imprime métricas por fold,
     calcula importances (Gini + Permutation) e guarda CSV com importances.
 
-    Retorna dicionário com métricas de CV (médias e por fold) e DataFrame de importances.
+    Retorna dicionário com:
+      - cv_metrics_folds  (DataFrame por fold)
+      - cv_metrics_mean   (dict com médias)
+      - feature_importance (DataFrame gini + perm)
+      - oof_prob          (Series com probabilidades OOF)
+
+    'sample_weight': Series/array alinhado a X.index com pesos (ex.: uniqueness*time-decay).
+    Os pesos são usados apenas no treino dentro de cada fold (avaliação é sempre OOS).
     """
     # Garantir tipos compatíveis
     X = X.astype(float).copy()
@@ -156,26 +170,33 @@ def run_baseline(
     cols = list(X.columns)
     folds = list(purged_kfold_indices(n, n_splits=n_splits, purge=purge, embargo=embargo))
 
-    # fábrica do RF
-def mk_rf() -> RandomForestClassifier:
-    """
-    Constrói o RandomForest evitando duplicar 'class_weight' quando também vem de rf_kwargs.
-    Dá prioridade ao valor do tuning (rf_best.json); se não vier, usa 'balanced_subsample'.
-    """
-    params = dict(rf_kwargs)                 # cópia para não mutar o original
-    cw = params.pop("class_weight", "balanced_subsample")
-    return RandomForestClassifier(
-        n_estimators=n_estimators,
-        max_depth=max_depth,
-        n_jobs=-1,
-        random_state=random_state,
-        class_weight=cw,
-        **params,                            # restantes hiperparâmetros do tuning
-    )
+    # preparar série de pesos alinhada ao índice de X (se fornecida)
+    sw_all: Optional[pd.Series] = None
+    if sample_weight is not None:
+        sw_all = pd.Series(sample_weight).reindex(X.index)
 
+    # --------------------------
+    # fábrica do RF (à prova de dup. de class_weight)
+    # --------------------------
+    def mk_rf() -> RandomForestClassifier:
+        """
+        Constrói o RandomForest sem duplicar 'class_weight'.
+        Se vier no rf_best.json usa-o; caso contrário aplica 'balanced_subsample'.
+        """
+        params = dict(rf_kwargs)                      # cópia para não mutar o original
+        params.setdefault("class_weight", "balanced_subsample")
+
+        return RandomForestClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            n_jobs=-1,
+            random_state=random_state,
+            **params,                                  # inclui (ou não) class_weight, mas só 1 vez
+        )
 
     # coletores
     rows: List[Dict] = []
+    oof_prob = np.full(n, np.nan)  # probabilidades out-of-fold
 
     print("=== Baseline: RandomForest (calibrated isotonic) + Purged K-Fold ===")
     print(f"n_splits={n_splits} | purge={purge} | embargo={embargo}")
@@ -183,14 +204,21 @@ def mk_rf() -> RandomForestClassifier:
     for i, f in enumerate(folds, start=1):
         base = mk_rf()
         clf = CalibratedClassifierCV(base, method="isotonic", cv=3)
-        clf.fit(X.iloc[f.train_idx], y.iloc[f.train_idx])
+
+        # pesos só para treino deste fold (se existirem)
+        sw = None
+        if sw_all is not None:
+            sw = sw_all.iloc[f.train_idx].values
+
+        clf.fit(X.iloc[f.train_idx], y.iloc[f.train_idx], sample_weight=sw)
 
         proba = clf.predict_proba(X.iloc[f.test_idx])[:, 1]
+        oof_prob[f.test_idx] = proba  # guardar previsões OOF
         pred_fixed = (proba >= 0.5).astype(int)
 
         acc = accuracy_score(y.iloc[f.test_idx], pred_fixed)
         f1f = f1_score(y.iloc[f.test_idx], pred_fixed, zero_division=0)
-        # roc_auc requer as probabilidades
+        # roc_auc requer as probabilidades; se só houver uma classe no fold, devolve NaN
         if len(np.unique(y.iloc[f.test_idx])) > 1:
             auc = roc_auc_score(y.iloc[f.test_idx], proba)
         else:
@@ -224,7 +252,11 @@ def mk_rf() -> RandomForestClassifier:
 
     # Reajustar no conjunto inteiro para importances (sem calibração)
     final_clf = mk_rf()
-    final_clf.fit(X, y)
+    # usar pesos completos no ajuste final, se existirem (reflete o treino base)
+    if sw_all is not None:
+        final_clf.fit(X, y, sample_weight=sw_all.values)
+    else:
+        final_clf.fit(X, y)
 
     # Gini importance
     gini = pd.Series(final_clf.feature_importances_, index=cols, name="gini").sort_values(ascending=False)
@@ -239,7 +271,7 @@ def mk_rf() -> RandomForestClassifier:
     )
     perm_ser = pd.Series(perm.importances_mean, index=cols, name="perm").sort_values(ascending=False)
 
-    # Guardar CSV com as duas medidas
+    # Guardar CSV com as duas medidas (redundante com o return, mas útil como artefacto)
     out = pd.DataFrame({"gini": gini, "perm": perm_ser})
     out.index.name = "feature"
     from pathlib import Path
@@ -249,11 +281,14 @@ def mk_rf() -> RandomForestClassifier:
     # Imprimir top-10 para inspeção rápida
     print("\nTop-10 importances (ordenado por perm):")
     top = out.sort_values("perm", ascending=False).head(10)
-    # to_string simples para evitar problemas de escape
     print(top.to_string(float_format=lambda v: f"{v:.4f}"))
 
+    # --------------------------
+    # RETORNO FINAL (usado pelo main.py)
+    # --------------------------
     return {
-        "cv_metrics_mean": means,
-        "cv_metrics_folds": metrics_df,
-        "feature_importance": out,
+        "cv_metrics_mean": {k: float(v) for k, v in means.items()},
+        "cv_metrics_folds": metrics_df,                         # DataFrame por fold
+        "feature_importance": out,                              # DataFrame (gini + perm)
+        "oof_prob": pd.Series(oof_prob, index=X.index, name="oof_prob"),  # Series OOF
     }

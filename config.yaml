@@ -24,3 +24,9 @@ output:
   dir: "data"
   save_csv: true
   save_parquet: true
+
+weights:
+  enabled: true
+  half_life_events: 50   # HL em nº de eventos; remove/mete null para "sem decaimento"
+  max_bars: 10
+
