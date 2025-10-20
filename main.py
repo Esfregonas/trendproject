@@ -4,12 +4,12 @@ Pipeline principal (didático):
 1) Lê config.yaml e liga ao TWS/Gateway (IB).
 2) Busca OHLCV históricos conforme a config.
 3) Constrói volume-bars OU dollar-bars conforme 'bars.kind' na config.
-4) Extrai features (volatilidade, ATR, entropia, LZ, CUSUM, VPIN).
+4) Extrai features (volatilidade, ATR, entropia, LZ, CUSUM, VPIN, FRACDIFF).
 5) Calcula labels (triple-barrier) e meta-labels.
 6) Monta matriz X e vetor y, grava em data/.
 7) Lê data/rf_best.json (se existir) e corre baseline com esses parâmetros
    (com calibração isotónica e métricas PR-AUC / F1@thr* no model.py).
-8) (NOVO) Constrói pesos AFML (uniqueness + time-decay por half-life) e passa-os ao treino.
+8) Constrói pesos AFML (uniqueness + time-decay por half-life) e passa-os ao treino.
 
 Nota: manter TWS aberto e API ativa (porta 7497).
 """
@@ -23,9 +23,9 @@ from datetime import datetime
 
 import pandas as pd
 
-# --- helpers do teu módulo data_fetcher (com explicações in-line) ---
+# --- helpers do teu módulo data_fetcher ---
 from data_fetcher import (
-    load_cfg,      # lê o config.yaml
+    load_cfg,      # lê o config.yaml (UTF-8)
     connect_ib,    # abre ligação ao TWS/Gateway
     make_contract, # fabrica Stock/FX/Future a partir do dict de config
     fetch_data,    # pede OHLCV e devolve DataFrame
@@ -41,8 +41,9 @@ from features import (
     cusum_efp,
     vpin,
 )
+from fracdiff import fracdiff_ffd              # <- NOVO (AFML cap. 5)
 from labeler import apply_triple_barrier, meta_labeling
-from weights import build_sample_weights  # <- AFML weights (uniqueness + time-decay)
+from weights import build_sample_weights       # AFML: uniqueness + time-decay
 from model import run_baseline
 
 
@@ -120,6 +121,19 @@ def main():
         sb_flag = cusum_efp(bars_df["close"], threshold=2.5)            # quebras
         vpin10  = vpin(bars_df, bucket_size=10)                         # fluxo ordens (proxy)
 
+        # --- NOVO: Fractional Differentiation (fixed-width) sobre o close
+        fd_cfg   = (cfg.get("fracdiff") or {})
+        fd_on    = bool(fd_cfg.get("enabled", True))    # por defeito ativo
+        fd_d     = float(fd_cfg.get("d", 0.5))
+        fd_thres = float(fd_cfg.get("thres", 1e-4))
+        fd_close = None
+        if fd_on:
+            fd_close = fracdiff_ffd(bars_df["close"], d=fd_d, thres=fd_thres)
+            print(f"Fracdiff ativado: d={fd_d} thres={fd_thres}")
+            print("fd_close head:\n", fd_close.head(), "\n")
+        else:
+            print("Fracdiff desativado (fracdiff.enabled=false).")
+
         print(f"Features calculadas em {perf_counter()-t_feats:.3f}s\n")
         print("vol10 head:\n",   vol10.head(),   "\n")
         print("atr14 head:\n",   atr14.head(),   "\n")
@@ -138,17 +152,19 @@ def main():
         print("Meta-labels (contagem):",      meta.value_counts().to_dict(), "\n")
 
         # 6) Montar matriz de features X
-        feats = pd.concat(
-            {
-                "vol10":   vol10,
-                "atr14":   atr14,
-                "sb_flag": sb_flag.astype(float),  # 0/1 -> float
-                "ent20":   ent20,
-                "lz20":    lz20,
-                "vpin10":  vpin10,
-            },
-            axis=1,
-        )
+        feat_dict = {
+            "vol10":   vol10,
+            "atr14":   atr14,
+            "sb_flag": sb_flag.astype(float),  # 0/1 -> float
+            "ent20":   ent20,
+            "lz20":    lz20,
+            "vpin10":  vpin10,
+        }
+        if fd_on and fd_close is not None:
+            colname = f"fd_close_d{str(fd_d).replace('.', '')}"
+            feat_dict[colname] = fd_close
+
+        feats = pd.concat(feat_dict, axis=1)
 
         # Limpar NaNs e alinhar com y (meta)
         X = feats.dropna()
@@ -160,7 +176,7 @@ def main():
         print(f"Shape X depois do dropna/alinhamento: {X.shape}")
         print("Distribuição y (meta):", y.value_counts().to_dict(), "\n")
 
-        # 6.1) (NOVO) Pesos AFML (uniqueness + time-decay), alinhados a X/y
+        # 6.1) Pesos AFML (uniqueness + time-decay), alinhados a X/y
         #      AFML: half-life em nº de eventos -> decay = 0.5 ** (1/HL)
         w_cfg = (cfg.get("weights") or {})
         use_w = w_cfg.get("enabled", True)  # por defeito ATIVO

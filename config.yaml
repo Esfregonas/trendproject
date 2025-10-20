@@ -30,3 +30,7 @@ weights:
   half_life_events: 50   # HL em nº de eventos; remove/mete null para "sem decaimento"
   max_bars: 10
 
+fracdiff:
+  enabled: false
+  d: 0.5
+  thres: 1e-4
